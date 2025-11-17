@@ -10,7 +10,7 @@ Source repository: https://github.com/HKUST-KnowComp/LLM-Multistep-Jailbreak
 """
 import copy
 import logging
-from fastchat.conversation import get_conv_template
+from easyjailbreak.utils.conversation import get_conv_template
 
 from easyjailbreak.attacker.attacker_base import AttackerBase
 from easyjailbreak.datasets.jailbreak_datasets import JailbreakDataset

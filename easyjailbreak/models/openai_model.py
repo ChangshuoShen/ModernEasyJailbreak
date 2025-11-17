@@ -2,7 +2,7 @@ import logging
 import warnings
 from .model_base import BlackBoxModelBase
 from openai import OpenAI
-from fastchat.conversation import get_conv_template
+from easyjailbreak.utils.conversation import get_conv_template
 from httpx import URL
 class OpenaiModel(BlackBoxModelBase):
     def __init__(self, model_name: str, api_keys: str, generation_config=None, base_url:str | URL | None = None,):

@@ -14,6 +14,8 @@ from easyjailbreak.datasets import JailbreakDataset, Instance
 from abc import ABC, abstractmethod
 from typing import Optional
 import logging
+import os
+from datetime import datetime
 
 __all__ = ['AttackerBase']
 
@@ -24,6 +26,7 @@ class AttackerBase(ABC):
         target_model: ModelBase,
         eval_model: Optional[ModelBase],
         jailbreak_datasets: JailbreakDataset,
+        checkpoint_dir: Optional[str] = None,
         **kwargs
     ):
         """
@@ -46,6 +49,13 @@ class AttackerBase(ABC):
         self.jailbreak_datasets = jailbreak_datasets
 
         self.logger = Logger()
+        self.run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._user_defined_checkpoint = checkpoint_dir or os.environ.get('CHECKPOINT_DIR')
+        base_checkpoint = self._user_defined_checkpoint
+        if base_checkpoint is None:
+            base_checkpoint = os.path.join(os.getcwd(), 'attack_runs', self.__class__.__name__.lower())
+        self._full_checkpoint_enabled = self._user_defined_checkpoint is not None
+        self.checkpoint_dir = os.path.abspath(os.path.join(base_checkpoint, f'{self.__class__.__name__.lower()}_{self.run_timestamp}'))
 
     def single_attack(self, instance: Instance) -> JailbreakDataset:
         """
@@ -75,3 +85,20 @@ class AttackerBase(ABC):
         logging.info(f"Total jailbreak: {cnt_attack_success}")
         logging.info(f"Total reject: {len(self.jailbreak_datasets)-cnt_attack_success}")
         logging.info("========Report End===========")
+
+    @property
+    def full_checkpoint_enabled(self) -> bool:
+        return self._full_checkpoint_enabled
+
+    def ensure_checkpoint_dir(self):
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+    def save_checkpoint_dataset(self, dataset: JailbreakDataset, filename: str) -> str:
+        """
+        Save the provided dataset into the attacker's checkpoint directory.
+        Returns the absolute path of the saved file.
+        """
+        self.ensure_checkpoint_dir()
+        file_path = os.path.join(self.checkpoint_dir, filename)
+        dataset.save_to_jsonl(file_path)
+        return file_path

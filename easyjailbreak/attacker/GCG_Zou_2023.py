@@ -29,7 +29,8 @@ class GCG(AttackerBase):
         batchsize: Optional[int] = None,
         top_k: int = 256,
         max_num_iter: int = 500,
-        is_universal: bool = False
+        is_universal: bool = False,
+        checkpoint_dir: Optional[str] = None
     ):
         """
         Initialize the GCG attacker.
@@ -48,7 +49,7 @@ class GCG(AttackerBase):
         :param bool is_universal: Experimental feature. Optimize a shared jailbreak prompt for all instances. Defaults to False.
         """
 
-        super().__init__(attack_model, target_model, None, jailbreak_datasets)
+        super().__init__(attack_model, target_model, None, jailbreak_datasets, checkpoint_dir=checkpoint_dir)
 
         if batchsize is None:
             batchsize = num_turb_sample
@@ -58,6 +59,7 @@ class GCG(AttackerBase):
         self.selector = ReferenceLossSelector(attack_model, batch_size=batchsize, is_universal=is_universal)
         self.evaluator = EvaluatorPrefixExactMatch()
         self.max_num_iter = max_num_iter
+        self._logged_success_ids = set()
 
     def single_attack(self, instance: Instance):
         dataset = self.jailbreak_datasets    # FIXME
@@ -95,16 +97,30 @@ class GCG(AttackerBase):
                 cnt_attack_success = 0
                 breaked_dataset = JailbreakDataset([])
                 unbreaked_dataset = JailbreakDataset([])
+                new_success_instances = []
                 for instance in self.jailbreak_datasets:
                     if instance.eval_results[-1]:
                         cnt_attack_success += 1
                         breaked_dataset.add(instance)
+                        instance_id = id(instance)
+                        if instance_id not in self._logged_success_ids:
+                            self._logged_success_ids.add(instance_id)
+                            new_success_instances.append(instance)
                     else:
                         unbreaked_dataset.add(instance)
                 logging.info(f"Successfully attacked: {cnt_attack_success}/{len(self.jailbreak_datasets)}")
-                if os.environ.get('CHECKPOINT_DIR') is not None:
-                    checkpoint_dir = os.environ.get('CHECKPOINT_DIR')
-                    self.jailbreak_datasets.save_to_jsonl(f'{checkpoint_dir}/gcg_{epoch}.jsonl')
+                if new_success_instances:
+                    success_file = self.save_checkpoint_dataset(
+                        JailbreakDataset(new_success_instances),
+                        f'gcg_new_success_epoch{epoch}.jsonl'
+                    )
+                    logging.info(f"Newly successful instances saved to {success_file}")
+                if self.full_checkpoint_enabled:
+                    full_file = self.save_checkpoint_dataset(
+                        self.jailbreak_datasets,
+                        f'gcg_{epoch}.jsonl'
+                    )
+                    logging.info(f"Checkpoint saved to {full_file}")
                 if cnt_attack_success == len(self.jailbreak_datasets):
                     break   # all instances is successfully attacked
         except KeyboardInterrupt:
