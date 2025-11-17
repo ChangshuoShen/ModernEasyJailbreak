@@ -16,12 +16,12 @@ import torch
 import torch.nn as nn
 import time
 import random
-from fastchat import model
 import nltk
 from nltk.corpus import stopwords, wordnet
 from transformers import AutoModelForCausalLM
 from tqdm import tqdm
 from itertools import islice
+from typing import Optional, List, Dict, Any
 from easyjailbreak.attacker import AttackerBase
 from easyjailbreak.datasets import JailbreakDataset
 from easyjailbreak.datasets.instance import Instance
@@ -32,18 +32,124 @@ from easyjailbreak.seed import SeedTemplate
 
 __all__ = ["AutoDAN", "autodan_PrefixManager"]
 
-def load_conversation_template(template_name):
+class SimpleConversationTemplate:
     r"""
-    load conversation template
+    This class provides a minimal interface compatible with autodan_PrefixManager.
+    """
+    def __init__(self, tokenizer, template_name: str = "unknown"):
+        self.tokenizer = tokenizer
+        self.name = template_name
+        self.messages: List[Dict[str, Optional[str]]] = []
+        
+        # Detect if tokenizer has chat template
+        self.use_hf_chat_template = bool(
+            hasattr(tokenizer, "apply_chat_template")
+            and getattr(tokenizer, "chat_template", None) is not None
+        )
+        
+        # Set roles based on template name or default
+        if template_name in ['llama-2', 'llama2']:
+            self.roles = ("[INST]", "[/INST]")
+            self.system = ""
+            self.sep = " "
+            self.sep2 = "</s>"
+        elif template_name == 'zero_shot':
+            self.roles = ("### Human:", "### Assistant:")
+            self.system = ""
+            self.sep = "\n"
+            self.sep2 = ""
+        else:
+            # Default roles
+            self.roles = ("USER:", "ASSISTANT:")
+            self.system = ""
+            self.sep = "\n"
+            self.sep2 = ""
+    
+    def append_message(self, role: str, message: Optional[str]):
+        r"""
+        Append a message to the conversation.
+        :param role: The role string (e.g., "[INST]" or "[/INST]").
+        :param message: The message content, can be None.
+        """
+        # Determine if this is user or assistant role
+        role_idx = 0 if role == self.roles[0] else 1
+        role_name = "user" if role_idx == 0 else "assistant"
+        self.messages.append({"role": role_name, "content": message})
+    
+    def update_last_message(self, message: str):
+        r"""
+        Update the last message in the conversation.
+        """
+        if self.messages:
+            self.messages[-1]["content"] = message
+    
+    def get_prompt(self) -> str:
+        r"""
+        Get the formatted prompt string.
+        """
+        if self.use_hf_chat_template:
+            # Filter out None messages for HF chat template
+            filtered_messages = [msg for msg in self.messages if msg["content"] is not None]
+            if not filtered_messages:
+                # If all messages are None, we need to handle this case for slice calculation
+                # Return a minimal prompt with just the role prefix
+                if self.messages and self.messages[-1]["role"] == "user":
+                    # For user role with None, return just the role prefix (will be tokenized)
+                    return self.roles[0] if self.roles[0] else ""
+                return ""
+            
+            # Use tokenizer's chat template
+            # Check if we should add generation prompt (last message is user with content)
+            add_gen_prompt = (len(self.messages) > 0 and 
+                            self.messages[-1]["role"] == "user" and 
+                            self.messages[-1]["content"] is not None)
+            return self.tokenizer.apply_chat_template(
+                filtered_messages,
+                tokenize=False,
+                add_generation_prompt=add_gen_prompt
+            )
+        else:
+            # Fallback: simple format
+            lines = []
+            for msg in self.messages:
+                if msg["content"] is None:
+                    # For None messages, just add the role prefix
+                    role_prefix = self.roles[0] if msg["role"] == "user" else self.roles[1]
+                    lines.append(role_prefix)
+                else:
+                    role_prefix = self.roles[0] if msg["role"] == "user" else self.roles[1]
+                    lines.append(f"{role_prefix} {msg['content']}")
+            
+            # If last message is user (with or without content), add assistant role for generation
+            if self.messages and self.messages[-1]["role"] == "user":
+                lines.append(self.roles[1])
+            
+            result = self.sep.join(lines) if self.sep else "".join(lines)
+            if self.sep2 and result:
+                result += self.sep2
+            return result
+
+
+def load_conversation_template(template_name: str, tokenizer):
+    r"""
+    Load conversation template using tokenizer
+    
+    :param str template_name: The name of the template (e.g., 'llama2', 'llama-2').
+    :param tokenizer: The tokenizer to use for chat template.
+    :return: A SimpleConversationTemplate instance.
     """
     if template_name == 'llama2':
         template_name = 'llama-2'
-    conv_template = model.get_conversation_template(template_name)
-    if conv_template.name == 'zero_shot':
+    
+    conv_template = SimpleConversationTemplate(tokenizer, template_name=template_name)
+    
+    if template_name == 'zero_shot':
         conv_template.roles = tuple(['### ' + r for r in conv_template.roles])
         conv_template.sep = '\n'
-    elif conv_template.name == 'llama-2':
-        conv_template.sep2 = conv_template.sep2.strip()
+    elif template_name == 'llama-2':
+        if hasattr(conv_template, 'sep2'):
+            conv_template.sep2 = conv_template.sep2.strip() if conv_template.sep2 else ""
+    
     return conv_template
 
 
@@ -163,7 +269,8 @@ class AutoDAN(AttackerBase):
         self.replace_words_with_synonyms_mutation = ReplaceWordsWithSynonyms(attr_name="jailbreak_prompt", word_dict={})
         self.rephrase_mutation = Rephrase(model=self.attack_model)
 
-        self.conv_template = load_conversation_template(model_name)
+        # MODIFIED: pass tokenizer to load_conversation_template
+        self.conv_template = load_conversation_template(model_name, tokenizer=self.target_model.tokenizer)
 
         # original candidate prompts
         self.reference = SeedTemplate().new_seeds(seeds_num=self.batch_size, prompt_usage='attack', method_list=["AutoDAN-a"])
@@ -562,6 +669,8 @@ class AutoDAN(AttackerBase):
 class autodan_PrefixManager:
     def __init__(self, *, tokenizer, conv_template, instruction, target, adv_string):
         r"""
+        :param tokenizer: The tokenizer to use.
+        :param conv_template: The conversation template (SimpleConversationTemplate instance).
         :param ~str instruction: the harmful query.
         :param ~str target: the target response for the query.
         :param ~str adv_string: the jailbreak prompt.
@@ -573,106 +682,71 @@ class autodan_PrefixManager:
         self.adv_string = adv_string
 
     def get_prompt(self, adv_string=None):
-
+        r"""
+        Build the prompt and calculate token slices for loss computation.
+        MODIFIED: Now works with tokenizer chat templates
+        """
         if adv_string is not None:
             self.adv_string = adv_string
 
+        # Build the full prompt with adv_string + instruction and target
+        self.conv_template.messages = []
         self.conv_template.append_message(self.conv_template.roles[0], f"{self.adv_string} {self.instruction} ")
         self.conv_template.append_message(self.conv_template.roles[1], f"{self.target}")
         prompt = self.conv_template.get_prompt()
 
-        encoding = self.tokenizer(prompt)
-        toks = encoding.input_ids
+        # Calculate slices by progressively building the prompt
+        # This approach works for both HF chat templates and fallback formats
+        self.conv_template.messages = []
 
-        if self.conv_template.name == 'llama-2':
-            self.conv_template.messages = []
-
-            self.conv_template.append_message(self.conv_template.roles[0], None)
-            toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
-            self._user_role_slice = slice(None, len(toks))
-
-            self.conv_template.update_last_message(f"{self.instruction}")
-            toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
-            self._goal_slice = slice(self._user_role_slice.stop, max(self._user_role_slice.stop, len(toks)))
-
-            separator = ' ' if self.instruction else ''
-            self.conv_template.update_last_message(f"{self.adv_string}{separator}{self.instruction}")
-            toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
-            self._control_slice = slice(self._goal_slice.stop, len(toks))
-
-            self.conv_template.append_message(self.conv_template.roles[1], None)
-            toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
-            self._assistant_role_slice = slice(self._control_slice.stop, len(toks))
-
-            self.conv_template.update_last_message(f"{self.target}")
-            toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
-            self._target_slice = slice(self._assistant_role_slice.stop, len(toks) - 2)
-            self._loss_slice = slice(self._assistant_role_slice.stop - 1, len(toks) - 3)
-
-        else:
-            python_tokenizer = False or self.conv_template.name == 'oasst_pythia'
-            try:
-                encoding.char_to_token(len(prompt) - 1)
-            except:
-                python_tokenizer = True
-
-            if python_tokenizer:
-                # This is specific to the vicuna and pythia tokenizer and conversation prompt.
-                # It will not work with other tokenizers or prompts.
-                self.conv_template.messages = []
-
-                self.conv_template.append_message(self.conv_template.roles[0], None)
-                toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
-                self._user_role_slice = slice(None, len(toks))
-
-                self.conv_template.update_last_message(f"{self.instruction}")
-                toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
-                self._goal_slice = slice(self._user_role_slice.stop, max(self._user_role_slice.stop, len(toks) - 1))
-
-                separator = ' ' if self.instruction else ''
-                self.conv_template.update_last_message(f"{self.adv_string}{separator}{self.instruction}")
-                toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
-                self._control_slice = slice(self._goal_slice.stop, len(toks) - 1)
-
-                self.conv_template.append_message(self.conv_template.roles[1], None)
-                toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
-                self._assistant_role_slice = slice(self._control_slice.stop, len(toks))
-
-                self.conv_template.update_last_message(f"{self.target}")
-                toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
-                self._target_slice = slice(self._assistant_role_slice.stop, len(toks) - 1)
-                self._loss_slice = slice(self._assistant_role_slice.stop - 1, len(toks) - 2)
+        def _tokenize_and_get_ids(text):
+            """Helper to tokenize and extract input_ids as a list."""
+            result = self.tokenizer(text, return_tensors=None, add_special_tokens=False)
+            if isinstance(result, dict):
+                ids = result['input_ids']
             else:
-                self._system_slice = slice(
-                    None,
-                    encoding.char_to_token(len(self.conv_template.system))
-                )
-                self._user_role_slice = slice(
-                    encoding.char_to_token(prompt.find(self.conv_template.roles[0])),
-                    encoding.char_to_token(
-                        prompt.find(self.conv_template.roles[0]) + len(self.conv_template.roles[0]) + 1)
-                )
-                self._goal_slice = slice(
-                    encoding.char_to_token(prompt.find(self.instruction)),
-                    encoding.char_to_token(prompt.find(self.instruction) + len(self.instruction))
-                )
-                self._control_slice = slice(
-                    encoding.char_to_token(prompt.find(self.adv_string)),
-                    encoding.char_to_token(prompt.find(self.adv_string) + len(self.adv_string))
-                )
-                self._assistant_role_slice = slice(
-                    encoding.char_to_token(prompt.find(self.conv_template.roles[1])),
-                    encoding.char_to_token(
-                        prompt.find(self.conv_template.roles[1]) + len(self.conv_template.roles[1]) + 1)
-                )
-                self._target_slice = slice(
-                    encoding.char_to_token(prompt.find(self.target)),
-                    encoding.char_to_token(prompt.find(self.target) + len(self.target))
-                )
-                self._loss_slice = slice(
-                    encoding.char_to_token(prompt.find(self.target)) - 1,
-                    encoding.char_to_token(prompt.find(self.target) + len(self.target)) - 1
-                )
+                ids = result
+            if isinstance(ids, list) and len(ids) > 0 and isinstance(ids[0], list):
+                ids = ids[0]
+            return ids
+
+        # Step 1: User role only
+        self.conv_template.append_message(self.conv_template.roles[0], None)
+        toks = _tokenize_and_get_ids(self.conv_template.get_prompt())
+        self._user_role_slice = slice(None, len(toks))
+
+        # Step 2: User role + instruction only
+        self.conv_template.update_last_message(f"{self.instruction}")
+        toks = _tokenize_and_get_ids(self.conv_template.get_prompt())
+        self._goal_slice = slice(self._user_role_slice.stop, max(self._user_role_slice.stop, len(toks)))
+
+        # Step 3: User role + adv_string + instruction
+        separator = ' ' if self.instruction else ''
+        self.conv_template.update_last_message(f"{self.adv_string}{separator}{self.instruction}")
+        toks = _tokenize_and_get_ids(self.conv_template.get_prompt())
+        self._control_slice = slice(self._goal_slice.stop, len(toks))
+
+        # Step 4: Add assistant role
+        self.conv_template.append_message(self.conv_template.roles[1], None)
+        toks = _tokenize_and_get_ids(self.conv_template.get_prompt())
+        self._assistant_role_slice = slice(self._control_slice.stop, len(toks))
+
+        # Step 5: Add target response
+        self.conv_template.update_last_message(f"{self.target}")
+        toks = _tokenize_and_get_ids(self.conv_template.get_prompt())
+        
+        # Get full prompt tokens for final slice calculation
+        full_toks = _tokenize_and_get_ids(prompt)
+        
+        # Calculate target and loss slices
+        # For llama-2, typically subtract 2 tokens (EOS tokens)
+        if self.conv_template.name == 'llama-2':
+            self._target_slice = slice(self._assistant_role_slice.stop, len(full_toks) - 2)
+            self._loss_slice = slice(self._assistant_role_slice.stop - 1, len(full_toks) - 3)
+        else:
+            # For other templates, assume 1 special token at the end (EOS)
+            self._target_slice = slice(self._assistant_role_slice.stop, len(full_toks) - 1)
+            self._loss_slice = slice(self._assistant_role_slice.stop - 1, len(full_toks) - 2)
 
         self.conv_template.messages = []
 
@@ -680,6 +754,12 @@ class autodan_PrefixManager:
 
     def get_input_ids(self, adv_string=None):
         prompt = self.get_prompt(adv_string=adv_string)
-        toks = self.tokenizer(prompt).input_ids
+        result = self.tokenizer(prompt, return_tensors=None, add_special_tokens=False)
+        if isinstance(result, dict):
+            toks = result['input_ids']
+        else:
+            toks = result
+        if isinstance(toks, list) and len(toks) > 0 and isinstance(toks[0], list):
+            toks = toks[0]
         input_ids = torch.tensor(toks[:self._target_slice.stop])
         return input_ids

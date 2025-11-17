@@ -9,15 +9,28 @@ import logging
 from transformers import set_seed
 from easyjailbreak.datasets import JailbreakDataset
 
-logging.basicConfig(level=logging.DEBUG, format='[%(asctime)s] {%(filename)s:%(lineno)d} %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.DEBUG, 
+    format='[%(asctime)s] {%(filename)s:%(lineno)d} %(levelname)s - %(message)s'
+
+)
 set_seed(42)
 
 # Load model and tokenizer
-model = easyjailbreak.models.from_pretrained('lmsys/vicuna-7b-v1.5', 'vicuna_v1.1', dtype=torch.bfloat16, max_new_tokens=40)
+model = easyjailbreak.models.from_pretrained(
+    model_name_or_path='meta-llama/Llama-3.1-8B-Instruct', 
+    dtype=torch.bfloat16, 
+    max_new_tokens=40
+)
 
 # Load dataset
-dataset_name = 'AdvBench'
-dataset = JailbreakDataset(dataset_name)
+# dataset_name = 'AdvBench'
+# dataset = JailbreakDataset(dataset_name)
+dataset = JailbreakDataset(
+    "advbench_test.json",
+    shuffle=True,
+    local_file_type="json")
+
 
 # API class initialization and settings
 attacker = easyjailbreak.attacker.GCG(

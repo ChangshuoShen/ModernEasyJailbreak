@@ -6,12 +6,6 @@ import copy
 import re
 import random
 from collections import Counter
-from fastchat.conversation import get_conv_template
-import copy
-import re
-import random
-from collections import Counter
-from fastchat.conversation import get_conv_template
 
 from ..models.model_base import WhiteBoxModelBase
 import torch
